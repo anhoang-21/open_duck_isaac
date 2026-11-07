@@ -1,0 +1,8 @@
+__pycache__/
+*.pyc
+
+# Training runs, benchmarks and diagnostics stay local; only the final policy is kept.
+logs/*
+!logs/run1/
+logs/run1/*
+!logs/run1/model_1649.pt

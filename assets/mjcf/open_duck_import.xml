@@ -1,0 +1,119 @@
+<mujoco model="open_duck_mini_v4">
+  <compiler angle="radian" meshdir="assets_v3/"/>
+
+  <option timestep="0.0005" tolerance="1e-10" integrator="implicitfast" cone="elliptic">
+    <flag nativeccd="disable"/>
+  </option>
+
+  <default>
+    <default class="open_duck_mini_v4">
+      <joint armature="0.005" frictionloss="0.1"/>
+      <default class="visual">
+        <geom type="mesh" contype="0" conaffinity="0" group="2"/>
+      </default>
+      <default class="collision">
+        <geom group="3"/>
+      </default>
+    </default>
+    <default class="sts3215">
+      <joint armature="0.027" damping="0.56" frictionloss="0.068"/>
+      <geom contype="0" conaffinity="0"/>
+      <general forcerange="-3.23 3.23" biastype="affine" gainprm="13.37" biasprm="0 -13.37"/>
+    </default>
+    <default class="backlash">
+      <joint range="-0.5 0.5" armature="0.01" damping="0.01" limited="true"/>
+    </default>
+  </default>
+
+  <asset>
+    <mesh name="base_link" file="base_link.STL" inertia="exact"/>
+    <mesh name="L1_hip_yaw" file="L1_hip_yaw.STL" inertia="exact"/>
+    <mesh name="L2_hip_roll" file="L2_hip_roll.STL" inertia="exact"/>
+    <mesh name="L3_hip_pitch" file="L3_hip_pitch.STL" inertia="exact"/>
+    <mesh name="L4_knee" file="L4_knee.STL" inertia="exact"/>
+    <mesh name="L5_ankle" file="L5_ankle.STL" inertia="convex"/>
+    <mesh name="R1_hip_yaw" file="R1_hip_yaw.STL" inertia="exact"/>
+    <mesh name="R2_hip_roll" file="R2_hip_roll.STL" inertia="exact"/>
+    <mesh name="R3_hip_pitch" file="R3_hip_pitch.STL" inertia="exact"/>
+    <mesh name="R4_knee" file="R4_knee.STL" inertia="exact"/>
+    <mesh name="R5_ankle" file="R5_ankle.STL" inertia="convex"/>
+  </asset>
+
+  <worldbody>
+    <body name="base_link" childclass="open_duck_mini_v4" pos="0 0 0.28">
+      <inertial pos="-0.012423 4.8073e-05 -0.0389507" quat="0.688564 -0.138557 -0.135888 0.698725" mass="0.7" diaginertia="0.00113228 0.00103994 0.000648181"/>
+      <joint name="floating_base" type="free" armature="0" frictionloss="0"/>
+      <geom class="visual" mass="0.7" mesh="base_link"/>
+      <site name="base" pos="0 0 -0.08286"/>
+      <site name="L0" quat="0.707107 0 0 0.707107" pos="0 0.035 -0.08286"/>
+      <site name="R0" quat="0.707107 0 0 -0.707107" pos="0 -0.035 -0.08286"/>
+      <site name="imu"/>
+      <body name="L1_hip_yaw" pos="0 0.035 -0.08286" quat="0.707107 0 0 0.707107">
+        <inertial pos="-7.43729e-07 -0.000220433 0.0147704" quat="0.999997 0.00228613 6.89909e-05 1.57722e-07" mass="0.08" diaginertia="4.61921e-05 4.26457e-05 1.70539e-05"/>
+        <joint name="L_hip_yaw" class="sts3215" range="-0.523599 0.523599"/>
+        <geom class="visual" mass="0.08" mesh="L1_hip_yaw"/>
+        <site name="L1_hip_yaw"/>
+        <body name="L2_hip_roll" pos="0 0.01606 0" quat="0.5 0.5 0.5 -0.5">
+          <inertial pos="-0.00115188 0.0410516 0.0202751" quat="0.625998 0.779365 0.0263464 0.00478105" mass="0.08" diaginertia="5.67687e-05 4.2643e-05 2.71124e-05"/>
+          <joint name="L_hip_roll" class="sts3215" range="-0.436332 0.436332"/>
+          <geom class="visual" mass="0.08" mesh="L2_hip_roll"/>
+          <site name="L2_hip_roll"/>
+          <body name="L3_hip_pitch" pos="0 0.0557 0" quat="0.707107 -0.707107 0 0">
+            <inertial pos="0.0402891 7.47728e-07 -0.00116645" quat="0.49279 0.507049 0.507107 0.492851" mass="0.08" diaginertia="6.64238e-05 5.15546e-05 2.67745e-05"/>
+            <joint name="L_hip_pitch" class="sts3215" range="-0.523599 1.22173"/>
+            <geom class="visual" mass="0.08" mesh="L3_hip_pitch"/>
+            <site name="L3_hip_pitch"/>
+            <body name="L4_knee" pos="0.07865 0 0">
+              <inertial pos="0.0402891 7.55317e-07 -0.00106646" quat="0.49279 0.507049 0.507108 0.49285" mass="0.08" diaginertia="6.64238e-05 5.15546e-05 2.67745e-05"/>
+              <joint name="L_knee" class="sts3215" range="-1.5708 1.5708"/>
+              <geom class="visual" mass="0.08" mesh="L4_knee"/>
+              <site name="L4_knee"/>
+              <body name="L5_ankle" pos="0.07865 0 0">
+                <inertial pos="0.0174481 -0.00899372 5.57995e-05" quat="0.707443 0.702131 0.0794511 -0.0149826" mass="0.08" diaginertia="6.18383e-05 6.07781e-05 2.55428e-05"/>
+                <joint name="L_ankle" class="sts3215" range="-1.5708 1.5708"/>
+                <geom class="visual" mass="0.08" mesh="L5_ankle"/>
+                <geom name="left_foot_collision" class="collision" type="mesh" friction="0.8" mesh="L5_ankle"/>
+                <site name="L5_ankle"/>
+                <site name="L6" pos="0.0388 0 0"/>
+                <site name="L6_IK" quat="0.5 0.5 -0.5 -0.5" pos="0.0388 0 0"/>
+              </body>
+            </body>
+          </body>
+        </body>
+      </body>
+      <body name="R1_hip_yaw" pos="0 -0.035 -0.08286" quat="0.707107 0 0 -0.707107">
+        <inertial pos="7.19078e-07 0.000220436 0.0147704" quat="0.999997 -0.00228609 -6.93858e-05 1.58622e-07" mass="0.08" diaginertia="4.61921e-05 4.26457e-05 1.70539e-05"/>
+        <joint name="R_hip_yaw" class="sts3215" range="-0.523599 0.523599"/>
+        <geom class="visual" mass="0.08" mesh="R1_hip_yaw"/>
+        <site name="R1_hip_yaw"/>
+        <body name="R2_hip_roll" pos="0 -0.01606 0" quat="0.5 -0.5 0.5 0.5">
+          <inertial pos="-0.00115317 -0.0410514 0.0202752" quat="0.779356 0.626002 -0.00466112 -0.0265359" mass="0.08" diaginertia="5.67693e-05 4.26423e-05 2.7112e-05"/>
+          <joint name="R_hip_roll" class="sts3215" range="-0.436332 0.436332"/>
+          <geom class="visual" mass="0.08" mesh="R2_hip_roll"/>
+          <site name="R2_hip_roll"/>
+          <body name="R3_hip_pitch" pos="0 -0.0557 0" quat="0.707107 0.707107 0 0">
+            <inertial pos="0.0402881 6.99661e-07 -0.00116732" quat="0.492806 0.507034 0.507092 0.492866" mass="0.08" diaginertia="6.64249e-05 5.15551e-05 2.67752e-05"/>
+            <joint name="R_hip_pitch" class="sts3215" range="-1.22173 0.523599"/>
+            <geom class="visual" mass="0.08" mesh="R3_hip_pitch"/>
+            <site name="R3_hip_pitch"/>
+            <body name="R4_knee" pos="0.07865 0 0">
+              <inertial pos="0.0402891 7.47572e-07 -0.00106646" quat="0.49279 0.507049 0.507108 0.49285" mass="0.08" diaginertia="6.64237e-05 5.15545e-05 2.67745e-05"/>
+              <joint name="R_knee" class="sts3215" range="-1.5708 1.5708"/>
+              <geom class="visual" mass="0.08" mesh="R4_knee"/>
+              <site name="R4_knee"/>
+              <body name="R5_ankle" pos="0.07865 0 0">
+                <inertial pos="0.0174506 0.00908049 0.000105938" quat="0.702077 0.707534 0.0129905 -0.0794634" mass="0.08" diaginertia="6.19456e-05 6.08675e-05 2.55229e-05"/>
+                <joint name="R_ankle" class="sts3215" range="-1.5708 1.5708"/>
+                <geom class="visual" mass="0.08" mesh="R5_ankle"/>
+                <geom name="right_foot_collision" class="collision" type="mesh" friction="0.8" mesh="R5_ankle"/>
+                <site name="R5_ankle"/>
+                <site name="R6" pos="0.0388 0 0"/>
+                <site name="R6_IK" quat="0.5 -0.5 -0.5 0.5" pos="0.0388 0 0"/>
+              </body>
+            </body>
+          </body>
+        </body>
+      </body>
+    </body>
+  </worldbody>
+</mujoco>
