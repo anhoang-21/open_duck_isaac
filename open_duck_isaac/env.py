@@ -3,7 +3,7 @@
 Every control step (50 Hz) and for every environment:
 
 1. Sensing like the real robot: IMU orientation and gyro (with noise), joint
-   angles; the CoM comes from leg odometry (``walker.LegOdometry``).
+   angles; the CoM is measured relative to the feet by FK (IMU orientation + joint angles).
 2. MPC walker (``walker.BatchedZmpWalker``): ZMP-MPC + capture point + IK +
    servo load compensation -> joint targets ``q_mpc``.
 3. Policy residual: ``q_target = q_mpc + action_scale * action``.
@@ -39,11 +39,11 @@ from isaaclab.utils import configclass
 from isaaclab.utils.math import matrix_from_quat
 
 from open_duck_isaac.constants import (
-  JOINT_NAMES, MJCF_PATH, SERVO_ARMATURE, SERVO_DAMPING, SERVO_EFFORT, SERVO_FRICTION, SERVO_KP, START_POSE,
+  JOINT_NAMES, MJCF_PATH, SERVO_ARMATURE, SERVO_DAMPING, SERVO_EFFORT, SERVO_FRICTION, SERVO_KP, START_POSE, start_pose,
   USD_DIR,
 )
 from open_duck_isaac.kinematics import RobotKinematics
-from open_duck_isaac.walker import BatchedZmpWalker, LegOdometry, WalkParams
+from open_duck_isaac.walker import BatchedZmpWalker, WalkParams
 
 ROBOT_USD = str(USD_DIR / "open_duck_import" / "open_duck_import.usda")
 START_JOINTS = dict(zip(JOINT_NAMES, (float(x) for x in START_POSE)))
@@ -149,6 +149,8 @@ class OpenDuckEnvCfg(DirectRLEnvCfg):
   state_space = 0
   action_scale = 0.1  # rad of residual per unit action
   max_delay_substeps = 4  # servo bus delay, 0..20 ms
+  start_hip_roll: float = 10.0  # deg, see constants.start_pose (0 = flat soles)
+  walk_overrides: dict | None = None  # WalkParams fields, e.g. {"step_gain": (0.4, 0.3)}
   gyro_noise = 0.05  # rad/s
   joint_noise = 0.005  # rad
   # commands (m/s), heading frame of the start pose
@@ -197,10 +199,9 @@ class OpenDuckEnv(DirectRLEnv):
 
     model = mujoco.MjModel.from_xml_path(str(MJCF_PATH))
     self.kin = RobotKinematics(model, dev)
-    self.wp = WalkParams(dt=self.step_dt)
+    self.wp = WalkParams(dt=self.step_dt, **(cfg.walk_overrides or {}))
     self.walker = BatchedZmpWalker(self.kin, n, self.wp)
-    self.odo = LegOdometry(self.kin, n, self.step_dt)
-    self.q0 = torch.as_tensor(START_POSE, dtype=torch.float32, device=dev)
+    self.q0 = torch.as_tensor(start_pose(cfg.start_hip_roll), dtype=torch.float32, device=dev)
     # Base height that puts the soles on the floor in the start pose.
     ks = self.kin.fk(torch.zeros(1, 3, device=dev), torch.eye(3, device=dev)[None], self.q0[None])
     self.base_z0 = float(-ks.site_pos[0, :, 2].min()) + 0.003
@@ -233,8 +234,7 @@ class OpenDuckEnv(DirectRLEnv):
     self.prev_actions = self.actions
     self.actions = actions.clamp(-5.0, 5.0)
     q = self._joint_pos() + self.cfg.joint_noise * torch.randn_like(self.actions)
-    com, vcom = self.odo.update(self._base_rot(), q, self.walker.contact)
-    self.q_mpc = self.walker.step(self.cmd, com, vcom, self.odo.foot_world.clone())
+    self.q_mpc = self.walker.step(self.cmd, self._base_rot(), q)
     target = (self.q_mpc + self.cfg.action_scale * self.actions).clamp(self.qmin, self.qmax)
     self.target_old = self.target_new
     self.target_new = target
@@ -268,7 +268,7 @@ class OpenDuckEnv(DirectRLEnv):
     ], 1)
     base_h = (d.root_pos_w.torch[:, 2] - self.scene.env_origins[:, 2])[:, None]
     priv = torch.cat([d.root_lin_vel_b.torch * 2.0, d.root_ang_vel_b.torch * 0.25, (base_h - self.base_z0) * 10.0,
-                      (self.odo.com[:, 2:3] - self.walker.com_height[:, None]) * 10.0], 1)
+                      (self.walker.com_meas[:, 2:3] - self.walker.com_height[:, None]) * 10.0], 1)
     return {"policy": obs, "critic": torch.cat([obs, priv], 1)}
 
   # ----------------------------------------------------------------- rewards
@@ -354,9 +354,8 @@ class OpenDuckEnv(DirectRLEnv):
     self.actions[env_ids] = 0.0
     self.prev_actions[env_ids] = 0.0
 
-    # Walker and odometry start from the reset pose (env-local frame).
+    # The walker starts from the reset pose (env-local frame).
     base_pos = torch.zeros(k, 3, device=dev)
     base_pos[:, 2] = self.base_z0
     rot = torch.eye(3, device=dev).repeat(k, 1, 1)
     self.walker.reset(env_ids, base_pos, rot, self.q0.repeat(k, 1))
-    self.odo.reset(env_ids, self.walker.feet0[env_ids].clone())

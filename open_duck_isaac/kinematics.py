@@ -152,6 +152,27 @@ class RobotKinematics:
     self.site_desc = self.desc[:, self.site_body].T  # (2, 10)
     # Joint ordering per leg (L: 0..4, R: 5..9).
     self.legs = (torch.arange(0, 5, device=self.device), torch.arange(5, 10, device=self.device))
+    # FK by tree depth: all bodies of one depth (left and right leg) in one batched step,
+    # which halves the number of small tensor ops (the cost on a CPU with batch 1).
+    depth = [0] * nb
+    for i in range(1, nb):
+      depth[i] = depth[self.parent[i]] + 1
+    self.levels = []
+    order = [0]
+    for d in range(1, max(depth) + 1):
+      ids = [i for i in range(nb) if depth[i] == d]
+      prev = [i for i in range(nb) if depth[i] == d - 1]
+      js = [self.joint_of_body[i] for i in ids]
+      k = skew(self.joint_axis[js])
+      self.levels.append(dict(
+        parent=torch.tensor([prev.index(self.parent[i]) for i in ids], device=self.device),
+        joint=torch.tensor(js, device=self.device),
+        pos0=self.body_pos0[ids], rot0=self.body_rot0[ids], axis=self.joint_axis[js], k=k, k2=k @ k,
+      ))
+      order += ids
+    self.body_from_level = torch.tensor([order.index(i) for i in range(nb)], device=self.device)
+    jorder = [j for lv in self.levels for j in lv["joint"].tolist()]
+    self.joint_from_level = torch.tensor([jorder.index(j) for j in range(10)], device=self.device)
 
   @staticmethod
   def _is_descendant(model: mujoco.MjModel, b: int, root: int) -> bool:
@@ -163,6 +184,33 @@ class RobotKinematics:
 
   # ------------------------------------------------------------------ FK
   def fk(self, base_pos: torch.Tensor, base_rot: torch.Tensor, q: torch.Tensor) -> KinState:
+    bsz = q.shape[0]
+    pos, rot = [base_pos[:, None]], [base_rot[:, None]]
+    axes, anchors = [], []
+    eye = torch.eye(3, device=q.device)
+    for lv in self.levels:
+      rp = rot[-1][:, lv["parent"]]  # (B, n, 3, 3)
+      x = pos[-1][:, lv["parent"]] + (rp @ lv["pos0"][..., None])[..., 0]
+      r_fixed = rp @ lv["rot0"]
+      a = q[:, lv["joint"]][..., None, None]
+      r = r_fixed @ (eye + torch.sin(a) * lv["k"] + (1 - torch.cos(a)) * lv["k2"])
+      axes.append((r_fixed @ lv["axis"][..., None])[..., 0])
+      anchors.append(x)
+      pos.append(x)
+      rot.append(r)
+    body_pos = torch.cat(pos, 1)[:, self.body_from_level]
+    body_rot = torch.cat(rot, 1)[:, self.body_from_level]
+    axis = torch.cat(axes, 1)[:, self.joint_from_level]
+    anchor = torch.cat(anchors, 1)[:, self.joint_from_level]
+    com_body = body_pos + (body_rot @ self.ipos[None, :, :, None]).squeeze(-1)
+    com = (self.mass[None, :, None] * com_body).sum(1) / self.total_mass
+    sb = self.site_body
+    site_pos = body_pos[:, sb] + (body_rot[:, sb] @ self.site_pos0[None, :, :, None]).squeeze(-1)
+    site_rot = body_rot[:, sb] @ self.site_rot0[None]
+    return KinState(body_pos, body_rot, com_body, com, site_pos, site_rot, axis, anchor)
+
+  def fk_reference(self, base_pos: torch.Tensor, base_rot: torch.Tensor, q: torch.Tensor) -> KinState:
+    """Body-by-body FK (the original loop), kept to check ``fk``."""
     bsz = q.shape[0]
     nb = len(self.bodies)
     pos = [base_pos]
@@ -233,8 +281,10 @@ class RobotKinematics:
     q_home: torch.Tensor,
     w: IkWeights,
     iterations: int | None = None,
+    ks0: KinState | None = None,
   ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, KinState]:
-    """Damped least squares from the given (warm-start) configuration."""
+    """Damped least squares from the given (warm-start) configuration. ``ks0``: its FK,
+    if already known (the result of the previous call), saves one FK."""
     dev = q.device
     bsz = q.shape[0]
     wt = torch.cat([
@@ -245,8 +295,8 @@ class RobotKinematics:
     eye_r = torch.eye(3, device=dev).expand(bsz, 3, 3)
     post = torch.cat([torch.zeros(10, 6, device=dev), torch.eye(10, device=dev)], 1).expand(bsz, 10, 16)
     damp = w.damping * torch.eye(16, device=dev)
-    for _ in range(iterations or w.iterations):
-      ks = self.fk(base_pos, base_rot, q)
+    for it in range(iterations or w.iterations):
+      ks = ks0 if (it == 0 and ks0 is not None) else self.fk(base_pos, base_rot, q)
       rows = [self.com_jac(ks, base_pos)]
       errs = [com_des - ks.com]
       for i in range(2):

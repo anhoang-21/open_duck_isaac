@@ -3,6 +3,8 @@ trained residual policy, and print survival / velocity / roll statistics.
 
   run.bat scripts/mpc_only.py --num-envs 64 --vx 0.1 --seconds 20
   run.bat scripts/mpc_only.py --no-dr --no-delay
+  run.bat scripts/mpc_only.py --no-dr --vx 0 --push 0.4                          # push sweep
+  run.bat scripts/mpc_only.py --no-dr --set "step_gain=(0,0.3)" "mpc_fb_vel=(0,0)"  # walker overrides
   run.bat scripts/mpc_only.py --checkpoint logs/run1/model_1649.pt --vx 0.1
 """
 
@@ -32,6 +34,12 @@ parser.add_argument("--no-delay", action="store_true")
 parser.add_argument("--monitor", type=int, default=0, help="print stability stats every N steps")
 parser.add_argument("--policy", default="", help="optional exported policy (TorchScript) instead of zero actions")
 parser.add_argument("--checkpoint", default="", help="optional rsl_rl checkpoint (model_*.pt) instead of zero actions")
+parser.add_argument("--set", nargs="*", action="extend", default=[], metavar="NAME=VALUE",
+                    help="override WalkParams fields, e.g. --set step_gain=(0.4,0.3)")
+parser.add_argument("--hip-roll", type=float, default=10.0, help="start pose hip roll [deg], 0 = flat soles")
+parser.add_argument("--push", type=float, default=0.0,
+                    help="push sweep: env i gets a base velocity kick of push * (i+1)/n [m/s] at t = 6, 9, 12, 15 s"
+                         " (+x, -x, +y, -y); the report gives the smallest kick that made a robot fall")
 AppLauncher.add_app_launcher_args(parser)
 args, _ = parser.parse_known_args()
 args.headless = True
@@ -48,6 +56,9 @@ if args.no_dr:
   cfg.joint_noise = 0.0
 if args.no_delay:
   cfg.max_delay_substeps = 0
+cfg.start_hip_roll = args.hip_roll
+if args.set:
+  cfg.walk_overrides = {kv.split("=", 1)[0]: eval(kv.split("=", 1)[1]) for kv in args.set}
 if args.vx is not None:
   cfg.vx_range = (args.vx, args.vx)
   cfg.vy_range = (0.0, 0.0)
@@ -82,9 +93,16 @@ alive = torch.ones(n, dtype=torch.bool, device=env.device)
 fall_t = torch.full((n,), float("nan"), device=env.device)
 roll_sq = torch.zeros(n, device=env.device)
 steps = int(args.seconds / env.step_dt)
+kick = args.push * torch.arange(1, n + 1, device=env.device) / n
+kicks = {int(round(tp / env.step_dt)): d for tp, d in ((6.0, (1, 0)), (9.0, (-1, 0)), (12.0, (0, 1)), (15.0, (0, -1)))}
 tic = time.perf_counter()
 with torch.inference_mode():
   for k in range(steps):
+    if args.push and k in kicks:
+      vel = env.robot.data.root_vel_w.torch.clone()
+      vel[:, 0] += kick * kicks[k][0]
+      vel[:, 1] += kick * kicks[k][1]
+      env.robot.write_root_velocity_to_sim_index(root_velocity=vel)
     if venv is not None:
       obs, _, _, _ = venv.step(policy(obs))
       term = env.reset_terminated.clone()  # falls only, not time-outs
@@ -110,6 +128,11 @@ moved = env.robot.data.root_pos_w.torch[:, :2] - start
 cmd = env.cmd
 print(f"{n} envs, {args.seconds:.0f} s sim in {wall:.1f} s wall ({n * steps / wall:,.0f} env-steps/s)")
 print(f"survived {alive.float().mean().item() * 100:.1f}%  (falls at {fall_t[~alive].nanmean().item() if (~alive).any() else float('nan'):.1f} s mean)")
+if args.push:
+  pushed = ~alive & (fall_t >= 6.0)
+  smallest = kick[pushed].min().item() if pushed.any() else float("nan")
+  print(f"push sweep 0..{args.push:.2f} m/s: smallest kick that made a robot fall {smallest:.3f} m/s;"
+        f" {alive.float().mean().item() * 100:.0f}% survived all 4 kicks")
 ok = alive
 if ok.any():
   v = moved[ok] / args.seconds

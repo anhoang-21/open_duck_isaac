@@ -1,7 +1,7 @@
 """Run the batched torch walker (batch of 1) on Open Duck in plain MuJoCo.
 
 Same setup as mjlab_cd2/scripts/mpc_walk.py (crouch10 start pose, position
-servos, leg odometry): checks that the GPU port walks like the original.
+servos, CoM measured by FK from the IMU orientation and joint angles): checks that the GPU port walks like the original.
 
   python scripts/check_walker_mujoco.py --duration 30 --latency 0.02 --vx 0.1
   python scripts/check_walker_mujoco.py --ideal --vx 0      # ideal actuators, step in place
@@ -15,9 +15,9 @@ import mujoco
 import numpy as np
 import torch
 
-from open_duck_isaac.constants import FOOT_SITES, JOINT_NAMES, MJCF_PATH, START_POSE
+from open_duck_isaac.constants import FOOT_SITES, JOINT_NAMES, MJCF_PATH, start_pose
 from open_duck_isaac.kinematics import RobotKinematics, quat_to_mat
-from open_duck_isaac.walker import BatchedZmpWalker, LegOdometry, WalkParams
+from open_duck_isaac.walker import BatchedZmpWalker, WalkParams
 
 
 IDEAL_MJCF_PATH = MJCF_PATH.with_name("open_duck_mini_v4_ideal.xml")
@@ -33,6 +33,20 @@ def build_model(path=MJCF_PATH) -> mujoco.MjModel:
   floor.type = mujoco.mjtGeom.mjGEOM_PLANE
   floor.size = [0, 0, 0.01]
   floor.contype = floor.conaffinity = 1
+  # Visual only: checker floor (shows the motion under the tracking camera) and lights.
+  tex = spec.add_texture()
+  tex.name, tex.type, tex.builtin = "grid", mujoco.mjtTexture.mjTEXTURE_2D, mujoco.mjtBuiltin.mjBUILTIN_CHECKER
+  tex.rgb1, tex.rgb2, tex.width, tex.height = [0.25, 0.3, 0.35], [0.35, 0.4, 0.45], 300, 300
+  tex.mark, tex.markrgb = mujoco.mjtMark.mjMARK_EDGE, [0.6, 0.6, 0.6]
+  mat = spec.add_material()
+  mat.name, mat.texrepeat, mat.reflectance = "grid", [10, 10], 0.1
+  mat.textures[mujoco.mjtTextureRole.mjTEXROLE_RGB] = "grid"
+  floor.material = "grid"
+  floor.size = [5, 5, 0.01]
+  light = spec.worldbody.add_light()
+  light.pos, light.dir, light.diffuse = [0, 0, 3], [0, 0, -1], [0.8, 0.8, 0.8]
+  spec.visual.headlight.ambient = [0.4, 0.4, 0.4]
+  spec.visual.headlight.diffuse = [0.6, 0.6, 0.6]
   return spec.compile()
 
 
@@ -42,15 +56,17 @@ def main():
   ap.add_argument("--vx", type=float, default=0.1)
   ap.add_argument("--vy", type=float, default=0.0)
   ap.add_argument("--latency", type=float, default=0.0)
-  ap.add_argument("--truth", action="store_true", help="true CoM instead of leg odometry")
+  ap.add_argument("--truth", action="store_true", help="true CoM velocity instead of the one measured relative to the stance foot")
   ap.add_argument("--video", default="")
   ap.add_argument("--push", type=float, default=0.0,
                   help="push the base with this force [N] for 0.1 s at t = 6, 9, 12, 15 s (+x, -x, +y, -y)")
   ap.add_argument("--trace", default="", help="save a per-tick trace (.npz) for plotting")
-  ap.add_argument("--set", nargs="*", default=[], metavar="NAME=VALUE",
+  ap.add_argument("--set", nargs="*", action="extend", default=[], metavar="NAME=VALUE",
                   help="override WalkParams fields, e.g. --set period=0.5 q_vel=1e-5")
   ap.add_argument("--ideal", action="store_true", help="ideal actuators (open_duck_mini_v4_ideal.xml), no load compensation")
+  ap.add_argument("--hip-roll", type=float, default=10.0, help="start pose hip roll [deg], 0 = flat soles")
   args = ap.parse_args()
+  START_POSE = start_pose(args.hip_roll)
   m = build_model(IDEAL_MJCF_PATH if args.ideal else MJCF_PATH)
   d = mujoco.MjData(m)
   qadr = np.array([m.jnt_qposadr[m.joint(n).id] for n in JOINT_NAMES])
@@ -71,11 +87,9 @@ def main():
 
   kin = RobotKinematics(m)
   walker = BatchedZmpWalker(kin, 1, p)
-  odo = LegOdometry(kin, 1, p.dt)
   t = lambda a: torch.tensor(np.asarray(a), dtype=torch.float32)[None]
   ids = torch.tensor([0])
   walker.reset(ids, t(d.qpos[:3]), quat_to_mat(t(d.qpos[3:7])), t(d.qpos[qadr]))
-  odo.reset(ids, walker.feet0.clone())
 
   renderer = None
   frames = []
@@ -91,16 +105,13 @@ def main():
   trace = {k: [] for k in ("t", "rp", "com", "com_plan", "zmp_plan", "feet", "feet_plan", "contact_plan", "dcm_err")}
   for k in range(int(args.duration / p.dt)):
     rot = quat_to_mat(t(d.qpos[3:7]))
+    vcom = None
     if args.truth:
       mujoco.mj_subtreeVel(m, d)
-      com, vcom = t(d.subtree_com[base]), t(d.subtree_linvel[base])
-      feet = t([d.site_xpos[s] for s in sites])
-    else:
-      com, vcom = odo.update(rot, t(d.qpos[qadr]), walker.contact)
-      feet = odo.foot_world.clone()
+      vcom = t(d.subtree_linvel[base])
     ramp = min(1.0, max(0.0, (k * p.dt - 2.0) / 1.0))
     cmd = torch.tensor([[args.vx * ramp, args.vy * ramp]])
-    q = walker.step(cmd, com, vcom, feet)[0].numpy()
+    q = walker.step(cmd, rot, t(d.qpos[qadr]), vcom)[0].numpy()
     pending.append((k * p.dt, q))
     for s in range(sub):
       now = k * p.dt + s * dt
@@ -129,6 +140,7 @@ def main():
       trace["feet_plan"].append(walker.out_feet[0].numpy().copy())
       trace["contact_plan"].append(walker.contact[0].numpy().copy())
       trace["dcm_err"].append(walker.dcm_err[0].numpy().copy())
+      trace.setdefault("state_err", []).append(walker.state_err[0].numpy().copy())
     if d.xpos[base][2] < 0.12 or abs(roll) > 0.7 or abs(pitch) > 0.7:
       fell = k * p.dt
       break

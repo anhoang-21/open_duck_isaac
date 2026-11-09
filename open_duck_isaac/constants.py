@@ -32,3 +32,12 @@ CROUCH10 = {
   "R_hip_yaw": 0.0, "R_hip_roll": _r(10), "R_hip_pitch": -_r(20), "R_knee": _r(40), "R_ankle": -_r(20),
 }
 START_POSE = np.array([CROUCH10[n] for n in JOINT_NAMES])
+
+
+def start_pose(hip_roll_deg: float = 10.0) -> np.ndarray:
+  """CROUCH10 with another hip roll (inward, deg). Without an ankle roll joint the sole
+  rolls with the leg: 10 deg puts the robot on the outer sole edges (feet 11.5 cm apart),
+  0 deg gives flat soles (feet 18.1 cm apart)."""
+  pose = dict(CROUCH10)
+  pose["L_hip_roll"], pose["R_hip_roll"] = -_r(hip_roll_deg), _r(hip_roll_deg)
+  return np.array([pose[n] for n in JOINT_NAMES])

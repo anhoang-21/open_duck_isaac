@@ -11,8 +11,13 @@ computer. Per control tick (50 Hz), for every environment:
    tracking over an 80-step horizon). The QP is solved without the ZMP box
    constraints, which makes it a fixed linear map (precomputed once): the
    reference keeps the ZMP well inside the soles, so the box is rarely active.
-3. Capture-point stepping: the landing of the swing foot moves by the DCM
-   error (measured minus planned), relative to the support feet.
+3. Footstep correction: the landing of the swing foot moves by the DCM error
+   (capture point) or the velocity error (Raibert), measured minus planned,
+   in x and y. Optionally the measured CoM state is fed back into the MPC.
+   The CoM is measured relative to the support feet by FK from the IMU
+   orientation and the joint angles (assumed at their planned positions):
+   balance only needs the CoM relative to the feet, so there is no world
+   position estimate (leg odometry) to drift.
 4. Swing trajectories, then whole-body IK (CoM, feet, base orientation,
    posture) to joint angles.
 5. Load compensation for position servos: ``q += tau / kp`` with ``tau`` the
@@ -24,6 +29,7 @@ The RL policy adds a residual to these joint targets.
 
 from __future__ import annotations
 
+import dataclasses
 from dataclasses import dataclass, field
 
 import numpy as np
@@ -39,20 +45,34 @@ class WalkParams:
   double_support: float = 0.1
   swing_height: float = 0.02
   zmp_offset_x: float = 0.005
-  zmp_offset_in: float = 0.004
+  # Lateral ZMP reference from the foot site, + = outward. In CROUCH10 the soles are
+  # rolled 10 deg and the robot stands on their outer edge (+-9.5 mm from the site), so the
+  # center of pressure can only sit near that edge in single support.
+  zmp_offset_out: float = 0.007
   zmp_box_back: float = 0.022
   zmp_box_front: float = 0.045
-  zmp_box_half_width: float = 0.009
+  zmp_box_half_width: float = 0.003  # around zmp_offset_out (the support strip along the edge)
   start_shift: float = 0.4
-  step_gain: tuple[float, float] = (0.0, 0.3)
+  # Landing correction of the step in progress, per axis (x, y):
+  #   "cp":      gain * DCM error (position + velocity / omega, measured - planned)
+  #   "raibert": (half period + raibert_gain) * velocity error (measured - planned)
+  footstep: str = "cp"
+  step_gain: tuple[float, float] = (0.4, 0.3)
+  raibert_gain: tuple[float, float] = (0.0, 0.0)
   step_limit: tuple[float, float] = (0.04, 0.03)
+  # State feedback into the ZMP-MPC: the initial state moves this fraction of the way from
+  # the plan to the estimate (CoM position, velocity) every tick, per axis (x, y);
+  # 0 = open-loop plan.
+  mpc_fb_pos: tuple[float, float] = (0.0, 0.0)
+  mpc_fb_vel: tuple[float, float] = (0.0, 0.2)  # x: the measured velocity is biased (the stance foot rolls), keep it open
   min_step_width: float = 0.12
   reanchor_x: bool = True
+  vel_filter: float = 0.5  # low-pass of the measured CoM velocity (1 = raw finite difference)
   load: float = 1.0  # load compensation, 0..1
   cop_moment: bool = True  # include the planned CoP moment in the load term
   servo_kp: float = 13.37
   ik: IkWeights = field(default_factory=IkWeights)
-  ik_iterations_warm: int = 3  # IK iterations per tick after the first
+  ik_iterations_warm: int = 1  # IK iterations per tick after the first (warm start)
   # ZMP MPC
   horizon: int = 80
   q_zmp: float = 1.0
@@ -96,6 +116,8 @@ class ZmpPreview:
     self.kv = f(hinv @ (p.q_vel * v_u.T))
     self.z_x, self.v_x = f(z_x), f(v_x)
     self.phi, self.gam = f(phi), f(gam)
+    self.kz0, self.kv0 = self.kz[0], self.kv[0]
+    self.a, self.b = f(a), f(b)
     self.c = f(c)
 
   def solve(self, x0: torch.Tensor, zref: torch.Tensor, vref: torch.Tensor) -> torch.Tensor:
@@ -104,6 +126,12 @@ class ZmpPreview:
     vf = x0 @ self.v_x.T
     u = (zref - zf) @ self.kz.T + (vref - vf) @ self.kv.T
     return torch.einsum("kij,bj->bki", self.phi, x0) + torch.einsum("kin,bn->bki", self.gam, u)
+
+  def step(self, x0: torch.Tensor, zref: torch.Tensor, vref: torch.Tensor) -> torch.Tensor:
+    """Receding horizon: only the first jerk of the plan is applied, so only the first
+    rows of the gains are needed. x0 (..., 3), zref/vref (..., N) -> next state (..., 3)."""
+    u0 = ((zref - x0 @ self.z_x.T) * self.kz0).sum(-1) + ((vref - x0 @ self.v_x.T) * self.kv0).sum(-1)
+    return x0 @ self.a.T + u0[..., None] * self.b
 
 
 class BatchedZmpWalker:
@@ -116,6 +144,7 @@ class BatchedZmpWalker:
     dev = self.dev = kin.device
     z3 = lambda *s: torch.zeros(num_envs, *s, device=dev)
     self.t = z3()
+    self.tick = torch.zeros(num_envs, dtype=torch.long, device=dev)  # t = tick * dt (no float drift)
     self.com_state = z3(2, 3)
     self.feet0 = z3(2, 3)
     self.foot_rot0 = torch.eye(3, device=dev).repeat(num_envs, 2, 1, 1)
@@ -130,7 +159,16 @@ class BatchedZmpWalker:
     self.com_height = z3()
     self.cmd = z3(2)  # vx, vy (heading frame of the start pose)
     self.contact = torch.ones(num_envs, 2, dtype=torch.bool, device=dev)
+    # Measurement (CoM relative to the feet by FK): last tick's values for the velocity.
+    self.rel_prev = z3(2, 3)
+    self.meas_contact = torch.ones(num_envs, 2, dtype=torch.bool, device=dev)
+    self.meas_fresh = torch.ones(num_envs, dtype=torch.bool, device=dev)
+    self.meas_good = torch.ones(num_envs, dtype=torch.bool, device=dev)
+    self.com_meas = z3(3)  # measured CoM in the plan frame
+    self.vcom_meas = z3(3)  # measured CoM velocity (relative to the stance feet)
     self.preview: ZmpPreview | None = None
+    self.ik_ks: KinState | None = None  # FK of the IK warm start (ik_base_pos, ik_base_rot, ik_q)
+    self._alternate = torch.arange(self.N_FOOTSTEPS - 3, device=dev) % 2
     self.omega = 1.0
     # Debug / observation outputs.
     self.out_q = z3(10)
@@ -138,6 +176,7 @@ class BatchedZmpWalker:
     self.out_feet = z3(2, 3)
     self.out_zmp = z3(2)
     self.dcm_err = z3(2)
+    self.state_err = z3(4)  # CoM position and velocity error (x, y), estimate - plan
     self.phase = z3()  # gait phase in [0, 1)
     self.bad = torch.zeros(num_envs, dtype=torch.bool, device=dev)  # non-finite input or IK this tick
 
@@ -147,6 +186,7 @@ class BatchedZmpWalker:
     p = self.p
     ks = self.kin.fk(base_pos, base_rot, q)
     self.t[env_ids] = 0.0
+    self.tick[env_ids] = 0
     self.feet0[env_ids] = ks.site_pos
     self.foot_rot0[env_ids] = remove_yaw(ks.site_rot)
     self.feet_start[env_ids] = ks.site_pos
@@ -160,7 +200,14 @@ class BatchedZmpWalker:
     self.ik_base_pos[env_ids] = base_pos
     self.ik_base_rot[env_ids] = base_rot
     self.ik_q[env_ids] = q
+    if self.ik_ks is not None:  # keep the cached warm-start FK in step with the reset pose
+      for f in dataclasses.fields(ks):
+        getattr(self.ik_ks, f.name)[env_ids] = getattr(ks, f.name)
     self.contact[env_ids] = True
+    self.meas_contact[env_ids] = True
+    self.meas_fresh[env_ids] = True
+    self.vcom_meas[env_ids] = 0.0
+    self.com_meas[env_ids] = ks.com
     self.dcm_err[env_ids] = 0.0
     if self.preview is None:
       h = float((ks.com[:, 2] - ks.site_pos[:, :, 2].mean(1)).mean())
@@ -172,9 +219,10 @@ class BatchedZmpWalker:
     """(step index, time into the step); -1 during the initial weight shift."""
     half = 0.5 * self.p.period
     tau = t - self.p.start_shift
-    j = torch.floor(tau / half).long()
-    local = tau - j * half
-    pre = tau < 0
+    eps = 1e-3 * self.p.dt  # t sits on the tick grid: round, don't truncate, at step boundaries
+    j = torch.floor((tau + eps) / half).long()
+    local = (tau - j * half).clamp_min(0.0)
+    pre = tau < -eps
     j = torch.where(pre, torch.full_like(j, -1), j)
     local = torch.where(pre, t, local)
     return j, local
@@ -211,32 +259,66 @@ class BatchedZmpWalker:
     p0 = self.feet_start[b, st]
     pm1 = self.feet_start[b, sw]
     p1 = torch.where(walking[:, None], self.landing, p0 + self._step_offset(sw))
-    pts = [pm1, p0, p1]
-    # Steps jb+1, jb+2, ...: the swing side alternates starting with st.
-    side = st.clone()
-    for _ in range(self.N_FOOTSTEPS - 3):
-      pts.append(pts[-1] + self._step_offset(side))
-      side = 1 - side
-    return torch.stack(pts, 1), jb
+    # Steps jb+1, jb+2, ...: the swing side alternates starting with st, so the
+    # offsets alternate between two values (the command is constant over the horizon).
+    off = torch.stack([self._step_offset(st), self._step_offset(sw)], 1)  # (B, 2, 3)
+    later = p1[:, None] + torch.cumsum(off[:, self._alternate], 1)
+    return torch.cat([pm1[:, None], p0[:, None], p1[:, None], later], 1), jb
 
   # --------------------------------------------------------------- update
   def _zmp_point(self, foot: torch.Tensor, side: torch.Tensor) -> torch.Tensor:
-    inward = torch.where(side == 0, -1.0, 1.0)
+    outward = torch.where(side == 0, 1.0, -1.0)  # left foot: +y
     return foot[..., :2] + torch.stack(
-      [torch.full_like(inward, self.p.zmp_offset_x), inward * self.p.zmp_offset_in], -1
+      [torch.full_like(outward, self.p.zmp_offset_x), outward * self.p.zmp_offset_out], -1
     )
+
+  def _measure(self, base_rot: torch.Tensor, q: torch.Tensor, j_now: torch.Tensor,
+               vcom: torch.Tensor | None) -> torch.Tensor:
+    """CoM relative to each foot site, (B, 2, 3), by FK from the IMU orientation and the
+    joint angles; also updates ``vcom_meas`` (low-pass filtered), or sets it to ``vcom``.
+
+    The velocity is the one of the CoM relative to the stance foot of the current step,
+    if it was on the ground at the last tick too (else the feet that were). In double
+    support the feet can slide against each other, and the foot that stays is the
+    reference for the rest of the step; averaging both feet there loses that slide
+    (under randomized friction this cost survival and roll in Isaac)."""
+    ks = self.kin.fk(torch.zeros(self.n, 3, device=self.dev), base_rot, q)
+    rel = ks.com[:, None, :] - ks.site_pos
+    stay = self.contact & self.meas_contact
+    b = torch.arange(self.n, device=self.dev)
+    st = self._stance(j_now.clamp_min(0))
+    only_st = torch.zeros_like(stay)
+    only_st[b, st] = True
+    use_st = (j_now >= 0) & stay[b, st]
+    stay = torch.where(use_st[:, None], only_st, stay).float()
+    v = ((rel - self.rel_prev) * stay[..., None]).sum(1) / stay.sum(1, keepdim=True).clamp_min(1.0) / self.p.dt
+    good = torch.isfinite(rel).flatten(1).all(1)
+    if vcom is not None:
+      good &= torch.isfinite(vcom).all(1)
+      v_new = vcom
+    else:
+      v = torch.where((good & ~self.meas_fresh)[:, None], v, torch.zeros_like(v))
+      v_new = (1.0 - self.p.vel_filter) * self.vcom_meas + self.p.vel_filter * v
+    self.vcom_meas = torch.where(good[:, None], v_new, torch.zeros_like(v_new))
+    self.rel_prev = rel
+    self.meas_contact = self.contact.clone()
+    self.meas_fresh = ~good  # restart the velocity after a non-finite measurement
+    self.meas_good = good
+    return rel
 
   def step(
     self,
     cmd: torch.Tensor,
-    com_meas: torch.Tensor,
-    vcom_meas: torch.Tensor,
-    feet_meas: torch.Tensor,
+    base_rot: torch.Tensor,
+    q: torch.Tensor,
+    vcom: torch.Tensor | None = None,
   ) -> torch.Tensor:
     """Advance all walkers by one tick; return joint targets (B, 10).
 
-    ``cmd`` (B, 2): vx, vy. ``com_meas``/``vcom_meas`` (B, 3) and ``feet_meas``
-    (B, 2, 3): estimated CoM, its velocity and the estimated foot positions.
+    ``cmd`` (B, 2): vx, vy. ``base_rot`` (B, 3, 3): base orientation (IMU), ``q``
+    (B, 10): measured joint angles. The CoM is measured relative to the support feet
+    (FK only, no world position estimate); its velocity relative to the stance foot,
+    unless ``vcom`` (B, 3) is given (e.g. the true CoM velocity in simulation).
     """
     p = self.p
     dev = self.dev
@@ -246,19 +328,10 @@ class BatchedZmpWalker:
     self.cmd = cmd
     t = self.t
     j_now, _ = self._phase(t)
-    # Non-finite estimates (a simulation blow-up): fall back to the plan.
-    good = torch.isfinite(com_meas).all(1) & torch.isfinite(vcom_meas).all(1) & torch.isfinite(feet_meas).flatten(1).all(1)
-    plan_com = torch.cat([self.com_state[:, :, 0], self.com_height[:, None]], 1)
-    com_meas = torch.where(good[:, None], com_meas, plan_com)
-    vcom_meas = torch.where(good[:, None], vcom_meas, torch.zeros_like(vcom_meas))
-    feet_meas = torch.where(good[:, None, None], feet_meas, self.feet_start)
+    rel = self._measure(base_rot, q, j_now, vcom)
+    good = self.meas_good  # non-finite measurement (a simulation blow-up): fall back to the plan
 
-    # 1. DCM error against the plan (before it advances).
-    dcm_meas = com_meas[:, :2] + vcom_meas[:, :2] / self.omega
-    dcm_plan = self.com_state[:, :, 0] + self.com_state[:, :, 1] / self.omega
-    dcm_err = dcm_meas - dcm_plan
-
-    # 2. New step: commit the landing, re-anchor x to the measured stance foot.
+    # 1. New step: commit the landing, re-anchor x to the measured stance foot.
     new = (j_now >= 0) & (j_now != self.last_step)
     if new.any():
       st = self._stance(j_now)
@@ -274,28 +347,42 @@ class BatchedZmpWalker:
       self.landing = torch.where(new[:, None], land, self.landing)
       self.nominal_landing = torch.where(new[:, None], land, self.nominal_landing)
       if p.reanchor_x:
-        shift = torch.where(new, feet_meas[b, st, 0] - self.feet_start[b, st, 0], torch.zeros_like(t))
+        # The new stance foot just landed: measured from the previous stance foot (still on
+        # the ground) by FK. Step 0 starts from the reset pose, no landing to measure.
+        landed = fs[b, sw, 0] + rel[b, sw, 0] - rel[b, st, 0]
+        shift = torch.where(later & good, landed - self.feet_start[b, st, 0], torch.zeros_like(t))
         self.feet_start[:, :, 0] += shift[:, None]
         self.landing[:, 0] += shift
         self.nominal_landing[:, 0] += shift
         self.com_state[:, 0, 0] += shift
-        dcm_err[:, 0] -= shift
     self.last_step = torch.where(j_now >= 0, j_now, torch.full_like(j_now, -1))
 
-    # 3. Error relative to the support feet (estimate vs plan).
+    # 2. Measured CoM in the plan frame: the support feet are where the plan put them.
     support = self.contact.float()
     planned = torch.where((j_now >= 0)[:, None, None], self.feet_start, self.feet0)
-    off = ((feet_meas[:, :, :2] - planned[:, :, :2]) * support[..., None]).sum(1) / support.sum(1, keepdim=True)
-    dcm_err = dcm_err - off
-    self.dcm_err = dcm_err
+    com_meas = ((planned + rel) * support[..., None]).sum(1) / support.sum(1, keepdim=True)
+    plan_com = torch.cat([self.com_state[:, :, 0], self.com_height[:, None]], 1)
+    self.com_meas = torch.where(good[:, None], com_meas, plan_com)
+    vcom_meas = self.vcom_meas
 
-    # 4. Capture-point stepping on the landing of the step in progress.
+    # 3. DCM and CoM state error, measured - planned.
+    dcm_plan = self.com_state[:, :, 0] + self.com_state[:, :, 1] / self.omega
+    self.dcm_err = self.com_meas[:, :2] + vcom_meas[:, :2] / self.omega - dcm_plan
+    dcm_err = self.dcm_err
+    pos_err = self.com_meas[:, :2] - self.com_state[:, :, 0]
+    vel_err = vcom_meas[:, :2] - self.com_state[:, :, 1]
+    self.state_err = torch.cat([pos_err, vel_err], 1)
+
+    # 4. Footstep correction of the landing of the step in progress.
     j_next, _ = self._phase(t + p.dt)
     adjust = (j_next >= 0) & (j_next == j_now)
-    gain = torch.tensor(p.step_gain, device=dev)
     lim = torch.tensor(p.step_limit, device=dev)
+    if p.footstep == "raibert":
+      corr = (half + torch.tensor(p.raibert_gain, device=dev)) * vel_err
+    else:
+      corr = torch.tensor(p.step_gain, device=dev) * dcm_err
     land = self.nominal_landing.clone()
-    land[:, :2] += torch.clamp(gain * dcm_err, -lim, lim)
+    land[:, :2] += torch.clamp(corr, -lim, lim)
     st = self._stance(j_now.clamp_min(0))
     stance_y = self.feet_start[b, st, 1]
     land[:, 1] = torch.where(
@@ -311,12 +398,12 @@ class BatchedZmpWalker:
     jk, lk = self._phase(tk)  # (B, N)
     zref = self._zmp_reference(pts, jb, jk, lk)
 
+    if any(p.mpc_fb_pos) or any(p.mpc_fb_vel):  # close the loop on the MPC state
+      self.com_state[:, :, 0] += torch.tensor(p.mpc_fb_pos, device=dev) * pos_err
+      self.com_state[:, :, 1] += torch.tensor(p.mpc_fb_vel, device=dev) * vel_err
     vref = self.cmd[:, None, :].expand(-1, n, -1)
-    states = torch.stack([
-      self.preview.solve(self.com_state[:, ax], zref[..., ax], vref[..., ax]) for ax in range(2)
-    ], 1)  # (B, 2, N, 3)
-    self.com_state = states[:, :, 0]
-    self.plan_states = states
+    # Both axes at once: x0 (B, 2, 3), references (B, 2, N).
+    self.com_state = self.preview.step(self.com_state, zref.transpose(1, 2), vref.transpose(1, 2))
 
     # 6. Feet at t + dt and the swing trajectory.
     j1, l1 = self._phase(t + p.dt)
@@ -329,6 +416,7 @@ class BatchedZmpWalker:
     base_pos, base_rot, q, ks = self.kin.ik(
       self.ik_base_pos, self.ik_base_rot, self.ik_q, com, feet, self.foot_rot0, self.q_home,
       p.ik, iterations=p.ik.iterations if first else p.ik_iterations_warm,
+      ks0=None if first else self.ik_ks,
     )
     self.ik_iterations_needed = False
     ok = torch.isfinite(q).all(1) & torch.isfinite(base_pos).all(1) & torch.isfinite(base_rot).flatten(1).all(1)
@@ -336,7 +424,9 @@ class BatchedZmpWalker:
     base_pos = torch.where(ok[:, None], base_pos, self.ik_base_pos)
     base_rot = torch.where(ok[:, None, None], base_rot, self.ik_base_rot)
     q = torch.where(ok[:, None], q, self.q_home)
-    self.ik_base_pos, self.ik_base_rot, self.ik_q = base_pos, base_rot, q
+    # FK of the warm start for the next tick (non-finite for a failed env: its next IK
+    # step is skipped, and the FK after it is finite again).
+    self.ik_base_pos, self.ik_base_rot, self.ik_q, self.ik_ks = base_pos, base_rot, q, ks
 
     # 8. Load compensation.
     acc = self.com_state[:, :, 2]
@@ -345,7 +435,8 @@ class BatchedZmpWalker:
       tau = self._load_torques(ks, contact, feet, acc, zmp)
       q = q + p.load * tau / p.servo_kp
 
-    self.t = t + p.dt
+    self.tick = self.tick + 1
+    self.t = self.tick.float() * p.dt
     self.out_q, self.out_com, self.out_feet, self.out_zmp = q, com, feet, zmp
     self.phase = torch.remainder((self.t - p.start_shift) / p.period, 1.0)
     return q
@@ -407,54 +498,10 @@ class BatchedZmpWalker:
     moments = None
     if p.cop_moment:
       cop = zmp[:, None, :] - feet[:, :, :2]
-      cop[:, :, 1] = torch.where(both[:, None], torch.zeros_like(cop[:, :, 1]), cop[:, :, 1])
+      out = torch.tensor([p.zmp_offset_out, -p.zmp_offset_out], device=cop.device)  # left, right
+      cop[:, :, 1] = torch.where(both[:, None], out.expand_as(cop[:, :, 1]), cop[:, :, 1])
       cop[:, :, 0] = cop[:, :, 0].clamp(-p.zmp_box_back, p.zmp_box_front)
-      cop[:, :, 1] = cop[:, :, 1].clamp(-p.zmp_box_half_width, p.zmp_box_half_width)
+      cop[:, :, 1] = (cop[:, :, 1] - out).clamp(-p.zmp_box_half_width, p.zmp_box_half_width) + out
       r = torch.cat([cop, torch.zeros_like(cop[..., :1])], -1)
       moments = torch.cross(r, forces, dim=-1) * contact[..., None]
     return self.kin.leg_torques(ks, forces * contact[..., None], moments)
-
-
-class LegOdometry:
-  """Batched CoM estimate from the IMU orientation and joint angles."""
-
-  def __init__(self, kin: RobotKinematics, num_envs: int, dt: float, vel_filter: float = 0.5):
-    self.kin = kin
-    self.dt = dt
-    self.alpha = vel_filter
-    dev = kin.device
-    self.foot_world = torch.zeros(num_envs, 2, 3, device=dev)
-    self.foot_z0 = torch.zeros(num_envs, 2, device=dev)
-    self.contact = torch.ones(num_envs, 2, dtype=torch.bool, device=dev)
-    self.com = torch.zeros(num_envs, 3, device=dev)
-    self.vcom = torch.zeros(num_envs, 3, device=dev)
-    self.fresh = torch.ones(num_envs, dtype=torch.bool, device=dev)
-
-  def reset(self, env_ids: torch.Tensor, feet_world: torch.Tensor) -> None:
-    self.foot_world[env_ids] = feet_world
-    self.foot_z0[env_ids] = feet_world[:, :, 2]
-    self.contact[env_ids] = True
-    self.vcom[env_ids] = 0.0
-    self.fresh[env_ids] = True
-
-  def update(self, base_rot: torch.Tensor, q: torch.Tensor, contact: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-    zero = torch.zeros(q.shape[0], 3, device=q.device)
-    ks = self.kin.fk(zero, base_rot, q)
-    anchor = self.contact & contact
-    none = ~anchor.any(1)
-    anchor = torch.where(none[:, None], self.contact, anchor)
-    anchor = torch.where(~anchor.any(1)[:, None], torch.ones_like(anchor), anchor)
-    w = anchor.float()
-    base = ((self.foot_world - ks.site_pos) * w[..., None]).sum(1) / w.sum(1, keepdim=True)
-    touchdown = contact & ~self.contact
-    landed = base[:, None, :] + ks.site_pos
-    landed[:, :, 2] = self.foot_z0
-    self.foot_world = torch.where(touchdown[..., None], landed, self.foot_world)
-    self.contact = contact.clone()
-    com = base + ks.com
-    v = (com - self.com) / self.dt
-    v = torch.where(self.fresh[:, None], torch.zeros_like(v), v)
-    self.vcom = (1 - self.alpha) * self.vcom + self.alpha * v
-    self.com = com
-    self.fresh[:] = False
-    return com, self.vcom
