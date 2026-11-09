@@ -4,6 +4,7 @@ Same setup as mjlab_cd2/scripts/mpc_walk.py (crouch10 start pose, position
 servos, leg odometry): checks that the GPU port walks like the original.
 
   python scripts/check_walker_mujoco.py --duration 30 --latency 0.02 --vx 0.1
+  python scripts/check_walker_mujoco.py --ideal --vx 0      # ideal actuators, step in place
 """
 import argparse
 import sys
@@ -19,8 +20,11 @@ from open_duck_isaac.kinematics import RobotKinematics, quat_to_mat
 from open_duck_isaac.walker import BatchedZmpWalker, LegOdometry, WalkParams
 
 
-def build_model() -> mujoco.MjModel:
-  spec = mujoco.MjSpec.from_file(str(MJCF_PATH))
+IDEAL_MJCF_PATH = MJCF_PATH.with_name("open_duck_mini_v4_ideal.xml")
+
+
+def build_model(path=MJCF_PATH) -> mujoco.MjModel:
+  spec = mujoco.MjSpec.from_file(str(path))
   for g in spec.geoms:
     if g.name in ("left_foot_collision", "right_foot_collision"):
       g.contype, g.conaffinity, g.condim, g.priority = 1, 1, 3, 1
@@ -40,12 +44,23 @@ def main():
   ap.add_argument("--latency", type=float, default=0.0)
   ap.add_argument("--truth", action="store_true", help="true CoM instead of leg odometry")
   ap.add_argument("--video", default="")
+  ap.add_argument("--push", type=float, default=0.0,
+                  help="push the base with this force [N] for 0.1 s at t = 6, 9, 12, 15 s (+x, -x, +y, -y)")
+  ap.add_argument("--trace", default="", help="save a per-tick trace (.npz) for plotting")
+  ap.add_argument("--set", nargs="*", default=[], metavar="NAME=VALUE",
+                  help="override WalkParams fields, e.g. --set period=0.5 q_vel=1e-5")
+  ap.add_argument("--ideal", action="store_true", help="ideal actuators (open_duck_mini_v4_ideal.xml), no load compensation")
   args = ap.parse_args()
-  m = build_model()
+  m = build_model(IDEAL_MJCF_PATH if args.ideal else MJCF_PATH)
   d = mujoco.MjData(m)
   qadr = np.array([m.jnt_qposadr[m.joint(n).id] for n in JOINT_NAMES])
   base = m.body("base_link").id
   sites = [m.site(s).id for s in FOOT_SITES]
+  p = WalkParams(load=0.0) if args.ideal else WalkParams()
+  for kv in args.set:
+    name, value = kv.split("=", 1)
+    old = getattr(p, name)
+    setattr(p, name, type(old)(eval(value)) if not isinstance(old, tuple) else tuple(eval(value)))
   d.qpos[3] = 1.0
   d.qpos[qadr] = START_POSE
   d.ctrl[:] = START_POSE
@@ -55,7 +70,6 @@ def main():
     mujoco.mj_step(m, d)
 
   kin = RobotKinematics(m)
-  p = WalkParams()
   walker = BatchedZmpWalker(kin, 1, p)
   odo = LegOdometry(kin, 1, p.dt)
   t = lambda a: torch.tensor(np.asarray(a), dtype=torch.float32)[None]
@@ -74,6 +88,7 @@ def main():
   x0 = d.subtree_com[base][0]
   pending = []
   rolls, fell = [], None
+  trace = {k: [] for k in ("t", "rp", "com", "com_plan", "zmp_plan", "feet", "feet_plan", "contact_plan", "dcm_err")}
   for k in range(int(args.duration / p.dt)):
     rot = quat_to_mat(t(d.qpos[3:7]))
     if args.truth:
@@ -93,20 +108,42 @@ def main():
         pending.pop(0)
       if pending[0][0] <= now - args.latency:
         d.ctrl[:] = pending[0][1]
+      d.xfrc_applied[base, :3] = 0.0
+      for tp, direction in ((6.0, (1, 0)), (9.0, (-1, 0)), (12.0, (0, 1)), (15.0, (0, -1))):
+        if args.push and tp <= now < tp + 0.1:
+          d.xfrc_applied[base, :2] = args.push * np.array(direction)
       mujoco.mj_step(m, d)
       if renderer is not None and (k * sub + s) % int(round(1 / (30 * dt))) == 0:
         renderer.update_scene(d, cam); frames.append(renderer.render())
     r = d.xmat[base].reshape(3, 3)
     roll, pitch = np.arctan2(r[2, 1], r[2, 2]), -np.arcsin(r[2, 0])
     rolls.append((roll, pitch))
+    if args.trace:
+      mujoco.mj_subtreeVel(m, d)
+      trace["t"].append((k + 1) * p.dt)
+      trace["rp"].append((roll, pitch))
+      trace["com"].append(d.subtree_com[base].copy())
+      trace["com_plan"].append(walker.out_com[0].numpy().copy())
+      trace["zmp_plan"].append(walker.out_zmp[0].numpy().copy())
+      trace["feet"].append(np.array([d.site_xpos[s] for s in sites]))
+      trace["feet_plan"].append(walker.out_feet[0].numpy().copy())
+      trace["contact_plan"].append(walker.contact[0].numpy().copy())
+      trace["dcm_err"].append(walker.dcm_err[0].numpy().copy())
     if d.xpos[base][2] < 0.12 or abs(roll) > 0.7 or abs(pitch) > 0.7:
       fell = k * p.dt
       break
   rp = np.degrees(np.array(rolls))
   print(f"{'FELL at %.2f s' % fell if fell is not None else 'no fall'}; moved {d.subtree_com[base][0] - x0:+.3f} m;"
         f" roll max {np.abs(rp[:, 0]).max():.1f} rms {rp[150:, 0].std():.1f} deg, pitch max {np.abs(rp[:, 1]).max():.1f} deg")
+  if args.trace:
+    np.savez(args.trace, **{k: np.array(v) for k, v in trace.items()})
   if renderer is not None:
     import mediapy
+    try:  # Windows: use the ffmpeg binary bundled with imageio-ffmpeg
+      import imageio_ffmpeg
+      mediapy.set_ffmpeg(imageio_ffmpeg.get_ffmpeg_exe())
+    except ImportError:
+      pass
     mediapy.write_video(args.video, frames, fps=30)
 
 
